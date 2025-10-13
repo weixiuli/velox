@@ -19,6 +19,7 @@
 #include "velox/common/base/SelectivityInfo.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/testutil/TestValue.h"
+#include "velox/common/serialization/Serializable.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/VectorHasher.h"
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
@@ -437,6 +438,105 @@ class HashTableTest : public testing::TestWithParam<bool>,
     }
   }
 
+  template <bool ignoreNullKeys>
+  void verifySerializationRoundTrip() {
+    std::vector<std::unique_ptr<VectorHasher>> hashers;
+    hashers.emplace_back(VectorHasher::create(BIGINT(), 0));
+    hashers.emplace_back(VectorHasher::create(VARCHAR(), 1));
+
+    std::vector<TypePtr> dependentTypes{DOUBLE()};
+    auto table = HashTable<ignoreNullKeys>::createForJoin(
+        std::move(hashers),
+        dependentTypes,
+        true, /* allowDuplicates */
+        true, /* hasProbedFlag */
+        0,
+        pool());
+
+    std::vector<std::string> values{"a", "b", "b", "d"};
+    auto batch = makeRowVector({
+        makeFlatVector<int64_t>({1, 2, 2, 3}),
+        makeFlatVector<StringView>(
+            values.size(),
+            [&](vector_size_t row) { return StringView(values[row]); }),
+        makeFlatVector<double>({1.0, 2.0, 3.0, 4.0}),
+    });
+    std::vector<RowVectorPtr> batches{batch};
+    copyVectorsToTable(batches, 0, table.get());
+    table->prepareJoinTable(
+        {}, BaseHashTable::kNoSpillInputStartPartitionBit, nullptr);
+
+    BaseHashTable* baseTable = table.get();
+    auto serialized = baseTable->serialize();
+    auto restoredBase = BaseHashTable::deserialize(serialized, pool());
+    auto* restored = dynamic_cast<HashTable<ignoreNullKeys>*>(restoredBase.get());
+    ASSERT_NE(restored, nullptr);
+
+    auto reserialized = restoredBase->serialize();
+    EXPECT_EQ(serialized.rows, reserialized.rows);
+    EXPECT_EQ(serialized.metadata, reserialized.metadata);
+
+    HashTableSerializedData::registerSerDe();
+    auto dynamicPayload = serialized.serialize();
+    auto roundTripped = velox::ISerializable::deserialize<HashTableSerializedData>(
+        dynamicPayload);
+    EXPECT_EQ(serialized.metadata, roundTripped.metadata);
+    EXPECT_EQ(serialized.rows, roundTripped.rows);
+
+    auto restoredFromDynamic =
+        BaseHashTable::deserialize(roundTripped, pool());
+    auto* restoredFromDynamicJoin =
+        dynamic_cast<HashTable<ignoreNullKeys>*>(restoredFromDynamic.get());
+    ASSERT_NE(restoredFromDynamicJoin, nullptr);
+    auto reserializedFromDynamic = restoredFromDynamic->serialize();
+    EXPECT_EQ(serialized.metadata, reserializedFromDynamic.metadata);
+    EXPECT_EQ(serialized.rows, reserializedFromDynamic.rows);
+
+    auto lookup = std::make_unique<HashLookup>(restored->hashers(), pool());
+    SelectivityVector rows(batch->size(), true);
+    lookup->reset(batch->size());
+    auto& hashersRef = restored->hashers();
+    for (auto i = 0; i < hashersRef.size(); ++i) {
+      auto key = batch->childAt(i);
+      if (restored->hashMode() != BaseHashTable::HashMode::kHash) {
+        hashersRef[i]->lookupValueIds(
+            *key, rows, lookup->scratchMemory, lookup->hashes);
+      } else {
+        hashersRef[i]->decode(*key, rows);
+        hashersRef[i]->hash(rows, i > 0, lookup->hashes);
+      }
+    }
+    for (vector_size_t i = 0; i < batch->size(); ++i) {
+      lookup->rows[i] = i;
+    }
+    restored->joinProbe(*lookup);
+    for (vector_size_t i = 0; i < batch->size(); ++i) {
+      EXPECT_NE(lookup->hits[i], nullptr);
+    }
+
+    auto dynamicLookup = std::make_unique<HashLookup>(
+        restoredFromDynamicJoin->hashers(), pool());
+    dynamicLookup->reset(batch->size());
+    auto& dynamicHashers = restoredFromDynamicJoin->hashers();
+    for (auto i = 0; i < dynamicHashers.size(); ++i) {
+      auto key = batch->childAt(i);
+      if (restoredFromDynamicJoin->hashMode() != BaseHashTable::HashMode::kHash) {
+        dynamicHashers[i]->lookupValueIds(
+            *key, rows, dynamicLookup->scratchMemory, dynamicLookup->hashes);
+      } else {
+        dynamicHashers[i]->decode(*key, rows);
+        dynamicHashers[i]->hash(rows, i > 0, dynamicLookup->hashes);
+      }
+    }
+    for (vector_size_t i = 0; i < batch->size(); ++i) {
+      dynamicLookup->rows[i] = i;
+    }
+    restoredFromDynamicJoin->joinProbe(*dynamicLookup);
+    for (vector_size_t i = 0; i < batch->size(); ++i) {
+      EXPECT_NE(dynamicLookup->hits[i], nullptr);
+    }
+  }
+
   void store(RowContainer& rowContainer, const RowVectorPtr& data) {
     std::vector<DecodedVector> decodedVectors;
     for (auto& vector : data->children()) {
@@ -799,6 +899,11 @@ TEST_P(HashTableTest, enableRangeWhereCan) {
 
   lookup->reset(data->size());
   insertGroups(*data, *lookup, *table);
+}
+
+TEST_P(HashTableTest, serializeDeserializeJoinTable) {
+  verifySerializationRoundTrip<true>();
+  verifySerializationRoundTrip<false>();
 }
 
 TEST_P(HashTableTest, arrayProbeNormalizedKey) {

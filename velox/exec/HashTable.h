@@ -15,12 +15,18 @@
  */
 #pragma once
 
+#include <folly/dynamic.h>
+#include <string>
+#include <vector>
+
 #include "velox/common/base/Portability.h"
+#include "velox/common/base/ClassName.h"
 #include "velox/common/memory/MemoryAllocator.h"
 #include "velox/exec/OneWayStatusFlag.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/RowContainer.h"
 #include "velox/exec/VectorHasher.h"
+#include "velox/common/serialization/Serializable.h"
 
 namespace facebook::velox::exec {
 
@@ -112,6 +118,30 @@ struct HashTableStats {
   int64_t numTombstones{0};
 };
 
+/// Serialized representation of a HashTable. `metadata` encodes table
+/// configuration (key channels, types, hash mode, etc.) and `rows` contains
+/// serialized row payloads produced by RowContainer::extractSerializedRows.
+struct HashTableSerializedData : public velox::ISerializable {
+  VELOX_DEFINE_CLASS_NAME(HashTableSerializedData);
+
+  folly::dynamic metadata{folly::dynamic::object};
+  std::vector<std::string> rows;
+
+  bool empty() const {
+    return rows.empty();
+  }
+
+  size_t rowCount() const {
+    return rows.size();
+  }
+
+  folly::dynamic serialize() const override;
+
+  static HashTableSerializedData create(const folly::dynamic& obj);
+
+  static void registerSerDe();
+};
+
 struct ParallelJoinBuildStats {
   std::vector<CpuWallTiming> partitionTimings;
   std::vector<CpuWallTiming> buildTimings;
@@ -158,6 +188,16 @@ class BaseHashTable {
 
   /// Returns the string of the given 'mode'.
   static std::string modeString(HashMode mode);
+
+  /// Serializes the hash table into a portable representation that can be
+  /// reconstituted using BaseHashTable::deserialize().
+  HashTableSerializedData serialize() const;
+
+  /// Restores a hash table from serialized representation using the provided
+  /// memory pool.
+  static std::unique_ptr<BaseHashTable> deserialize(
+      const HashTableSerializedData& serialized,
+      memory::MemoryPool* pool);
 
   /// Keeps track of results returned from a join table. One batch of keys can
   /// produce multiple batches of results. This is initialized from HashLookup,
@@ -618,6 +658,15 @@ class HashTable : public BaseHashTable {
       const RowVectorPtr& input,
       SelectivityVector& rows,
       bool decodeAndRemoveNulls) override;
+
+  /// Serializes table metadata and row contents into a transferable format.
+  HashTableSerializedData serialize() const;
+
+  /// Reconstructs a hash table instance from serialized data and metadata.
+  static std::unique_ptr<HashTable> deserialize(
+      const HashTableSerializedData& serialized,
+      const folly::dynamic& metadata,
+      memory::MemoryPool* pool);
 
   void prepareForGroupProbe(
       HashLookup& lookup,
