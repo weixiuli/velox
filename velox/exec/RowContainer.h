@@ -404,6 +404,9 @@ class RowContainer {
       vector_size_t index,
       char* row);
 
+  /// Copies serialized row data into the container.
+  void storeSerializedRow(StringView serialized, char* row);
+
   /// Copies the values at 'col' into 'result' (starting at 'resultOffset')
   /// for the 'numRows' rows pointed to by 'rows'. If a 'row' is null, sets
   /// corresponding row in 'result' to null.
