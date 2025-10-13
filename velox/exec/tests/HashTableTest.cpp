@@ -16,6 +16,7 @@
 
 #include "velox/exec/HashTable.h"
 #include "folly/experimental/EventCount.h"
+#include "folly/json.h"
 #include "velox/common/base/SelectivityInfo.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/testutil/TestValue.h"
@@ -437,6 +438,69 @@ class HashTableTest : public testing::TestWithParam<bool>,
     }
   }
 
+  template <bool ignoreNullKeys>
+  void verifySerializationRoundTrip() {
+    std::vector<std::unique_ptr<VectorHasher>> hashers;
+    hashers.emplace_back(VectorHasher::create(BIGINT(), 0));
+    hashers.emplace_back(VectorHasher::create(VARCHAR(), 1));
+
+    std::vector<TypePtr> dependentTypes{DOUBLE()};
+    auto table = HashTable<ignoreNullKeys>::createForJoin(
+        std::move(hashers),
+        dependentTypes,
+        true, /* allowDuplicates */
+        true, /* hasProbedFlag */
+        0,
+        pool());
+
+    std::vector<std::string> values{"a", "b", "b", "d"};
+    auto batch = makeRowVector({
+        makeFlatVector<int64_t>({1, 2, 2, 3}),
+        makeFlatVector<StringView>(
+            values.size(),
+            [&](vector_size_t row) { return StringView(values[row]); }),
+        makeFlatVector<double>({1.0, 2.0, 3.0, 4.0}),
+    });
+    std::vector<RowVectorPtr> batches{batch};
+    copyVectorsToTable(batches, 0, table.get());
+    table->prepareJoinTable(
+        {}, BaseHashTable::kNoSpillInputStartPartitionBit, nullptr);
+
+    BaseHashTable* baseTable = table.get();
+    auto serialized = baseTable->serialize();
+    auto restoredBase = BaseHashTable::deserialize(serialized, pool());
+    auto* restored = dynamic_cast<HashTable<ignoreNullKeys>*>(restoredBase.get());
+    ASSERT_NE(restored, nullptr);
+
+    auto reserialized = restoredBase->serialize();
+    EXPECT_EQ(serialized.rows, reserialized.rows);
+    EXPECT_EQ(
+        folly::parseJson(serialized.metadataJson),
+        folly::parseJson(reserialized.metadataJson));
+
+    auto lookup = std::make_unique<HashLookup>(restored->hashers(), pool());
+    SelectivityVector rows(batch->size(), true);
+    lookup->reset(batch->size());
+    auto& hashersRef = restored->hashers();
+    for (auto i = 0; i < hashersRef.size(); ++i) {
+      auto key = batch->childAt(i);
+      if (restored->hashMode() != BaseHashTable::HashMode::kHash) {
+        hashersRef[i]->lookupValueIds(
+            *key, rows, lookup->scratchMemory, lookup->hashes);
+      } else {
+        hashersRef[i]->decode(*key, rows);
+        hashersRef[i]->hash(rows, i > 0, lookup->hashes);
+      }
+    }
+    for (vector_size_t i = 0; i < batch->size(); ++i) {
+      lookup->rows[i] = i;
+    }
+    restored->joinProbe(*lookup);
+    for (vector_size_t i = 0; i < batch->size(); ++i) {
+      EXPECT_NE(lookup->hits[i], nullptr);
+    }
+  }
+
   void store(RowContainer& rowContainer, const RowVectorPtr& data) {
     std::vector<DecodedVector> decodedVectors;
     for (auto& vector : data->children()) {
@@ -799,6 +863,11 @@ TEST_P(HashTableTest, enableRangeWhereCan) {
 
   lookup->reset(data->size());
   insertGroups(*data, *lookup, *table);
+}
+
+TEST_P(HashTableTest, serializeDeserializeJoinTable) {
+  verifySerializationRoundTrip<true>();
+  verifySerializationRoundTrip<false>();
 }
 
 TEST_P(HashTableTest, arrayProbeNormalizedKey) {
