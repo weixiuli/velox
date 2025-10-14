@@ -442,19 +442,6 @@ class HashTableTest : public testing::TestWithParam<bool>,
 
   template <bool ignoreNullKeys>
   void verifySerializationRoundTrip() {
-    std::vector<std::unique_ptr<VectorHasher>> hashers;
-    hashers.emplace_back(VectorHasher::create(BIGINT(), 0));
-    hashers.emplace_back(VectorHasher::create(VARCHAR(), 1));
-
-    std::vector<TypePtr> dependentTypes{DOUBLE()};
-    auto table = HashTable<ignoreNullKeys>::createForJoin(
-        std::move(hashers),
-        dependentTypes,
-        true, /* allowDuplicates */
-        true, /* hasProbedFlag */
-        0,
-        pool());
-
     std::vector<std::string> values{"a", "b", "b", "d"};
     auto batch = makeRowVector({
         makeFlatVector<int64_t>({1, 2, 2, 3}),
@@ -464,9 +451,18 @@ class HashTableTest : public testing::TestWithParam<bool>,
         makeFlatVector<double>({1.0, 2.0, 3.0, 4.0}),
     });
     std::vector<RowVectorPtr> batches{batch};
-    copyVectorsToTable(batches, 0, table.get());
-    table->prepareJoinTable(
-        {}, BaseHashTable::kNoSpillInputStartPartitionBit, nullptr);
+    HashTableBuildConfig config;
+    config.keyTypes = {BIGINT(), VARCHAR()};
+    config.keyChannels = {0, 1};
+    config.dependentTypes = {DOUBLE()};
+    config.dependentChannels = {2};
+    config.ignoreNullKeys = ignoreNullKeys;
+    config.allowDuplicates = true;
+    config.hasProbedFlag = true;
+
+    auto table = buildHashTable(config, batches, pool());
+    ASSERT_NE(table, nullptr);
+    ASSERT_NE(dynamic_cast<HashTable<ignoreNullKeys>*>(table.get()), nullptr);
 
     BaseHashTable* baseTable = table.get();
     auto serialized = baseTable->serialize();

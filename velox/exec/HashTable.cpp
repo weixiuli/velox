@@ -36,8 +36,104 @@ namespace facebook::velox::exec {
 
 namespace {
 std::once_flag kRegisterHashTableSerializedDataFlag;
-}
 
+template <bool ignoreNullKeys>
+std::unique_ptr<BaseHashTable> buildHashTableImpl(
+    const HashTableBuildConfig& config,
+    const std::vector<RowVectorPtr>& batches,
+    memory::MemoryPool* pool) {
+  VELOX_CHECK_EQ(
+      config.keyTypes.size(),
+      config.keyChannels.size(),
+      "Key type/channel mismatch when building hash table");
+  VELOX_CHECK_EQ(
+      config.dependentTypes.size(),
+      config.dependentChannels.size(),
+      "Dependent type/channel mismatch when building hash table");
+
+  std::vector<std::unique_ptr<VectorHasher>> hashers;
+  hashers.reserve(config.keyTypes.size());
+  for (size_t i = 0; i < config.keyTypes.size(); ++i) {
+    hashers.emplace_back(
+        VectorHasher::create(config.keyTypes[i], config.keyChannels[i]));
+  }
+
+  auto table = HashTable<ignoreNullKeys>::createForJoin(
+      std::move(hashers),
+      config.dependentTypes,
+      config.allowDuplicates,
+      config.hasProbedFlag,
+      config.minTableSizeForParallelJoinBuild,
+      pool);
+
+  auto& tableHashers = table->hashers();
+  auto* rowContainer = table->rows();
+  const auto nextOffset = rowContainer->nextOffset();
+
+  for (const auto& batch : batches) {
+    if (batch == nullptr || batch->size() == 0) {
+      continue;
+    }
+
+    SelectivityVector rows(batch->size(), true);
+    for (size_t i = 0; i < tableHashers.size(); ++i) {
+      const auto channel = tableHashers[i]->channel();
+      VELOX_CHECK_LT(
+          channel,
+          batch->childrenSize(),
+          "Key channel {} exceeds build batch width {}",
+          channel,
+          batch->childrenSize());
+      auto keyVector = batch->childAt(channel)->loadedVector();
+      tableHashers[i]->decode(*keyVector, rows);
+    }
+
+    if constexpr (ignoreNullKeys) {
+      deselectRowsWithNulls(tableHashers, rows);
+    }
+    rows.updateBounds();
+    if (!rows.hasSelections()) {
+      continue;
+    }
+
+    std::vector<DecodedVector> dependents(config.dependentChannels.size());
+    for (size_t i = 0; i < config.dependentChannels.size(); ++i) {
+      const auto channel = config.dependentChannels[i];
+      VELOX_CHECK_LT(
+          channel,
+          batch->childrenSize(),
+          "Dependent channel {} exceeds build batch width {}",
+          channel,
+          batch->childrenSize());
+      dependents[i].decode(*batch->childAt(channel)->loadedVector(), rows);
+    }
+
+    rows.applyToSelected([&](auto rowIndex) {
+      char* newRow = rowContainer->newRow();
+      if (nextOffset) {
+        *reinterpret_cast<char**>(newRow + nextOffset) = nullptr;
+      }
+      for (size_t i = 0; i < tableHashers.size(); ++i) {
+        rowContainer->store(
+            tableHashers[i]->decodedVector(), rowIndex, newRow, i);
+      }
+      for (size_t i = 0; i < dependents.size(); ++i) {
+        rowContainer->store(
+            dependents[i],
+            rowIndex,
+            newRow,
+            tableHashers.size() + i);
+      }
+    });
+  }
+
+  table->prepareJoinTable(
+      {}, BaseHashTable::kNoSpillInputStartPartitionBit, nullptr);
+
+  return std::unique_ptr<BaseHashTable>(std::move(table));
+}
+} // namespace
+ 
 folly::dynamic HashTableSerializedData::serialize() const {
   folly::dynamic obj = folly::dynamic::object;
   obj["name"] = HashTableSerializedData::getClassName();
@@ -2504,6 +2600,17 @@ void HashTable<ignoreNullKeys>::prepareForJoinProbe(
   }
 
   populateLookupRows(rows, lookup.rows);
+}
+
+std::unique_ptr<BaseHashTable> buildHashTable(
+    const HashTableBuildConfig& config,
+    const std::vector<RowVectorPtr>& batches,
+    memory::MemoryPool* pool) {
+  VELOX_CHECK_NOT_NULL(pool, "Hash table build requires a memory pool");
+  if (config.ignoreNullKeys) {
+    return buildHashTableImpl<true>(config, batches, pool);
+  }
+  return buildHashTableImpl<false>(config, batches, pool);
 }
 
 } // namespace facebook::velox::exec
