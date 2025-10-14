@@ -24,6 +24,7 @@
 #include "velox/exec/VectorHasher.h"
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
+#include "velox/type/Type.h"
 
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <gmock/gmock-matchers.h>
@@ -93,6 +94,7 @@ class HashTableTest : public testing::TestWithParam<bool>,
  protected:
   static void SetUpTestCase() {
     memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
+    Type::registerSerDe();
   }
 
   void SetUp() override {
