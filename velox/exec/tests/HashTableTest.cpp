@@ -478,13 +478,15 @@ class HashTableTest : public testing::TestWithParam<bool>,
 
     HashTableSerializedData::registerSerDe();
     auto dynamicPayload = serialized.serialize();
-    auto roundTripped = velox::ISerializable::deserialize<HashTableSerializedData>(
-        dynamicPayload);
-    EXPECT_EQ(serialized.metadata, roundTripped.metadata);
-    EXPECT_EQ(serialized.rows, roundTripped.rows);
+    auto roundTripped =
+        velox::ISerializable::deserialize<HashTableSerializedData>(
+            dynamicPayload);
+    ASSERT_NE(roundTripped, nullptr);
+    EXPECT_EQ(serialized.metadata, roundTripped->metadata);
+    EXPECT_EQ(serialized.rows, roundTripped->rows);
 
     auto restoredFromDynamic =
-        BaseHashTable::deserialize(roundTripped, pool());
+        BaseHashTable::deserialize(*roundTripped, pool());
     auto* restoredFromDynamicJoin =
         dynamic_cast<HashTable<ignoreNullKeys>*>(restoredFromDynamic.get());
     ASSERT_NE(restoredFromDynamicJoin, nullptr);

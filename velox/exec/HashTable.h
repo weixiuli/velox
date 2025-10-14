@@ -16,6 +16,7 @@
 #pragma once
 
 #include <folly/dynamic.h>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -124,6 +125,8 @@ struct HashTableStats {
 struct HashTableSerializedData : public velox::ISerializable {
   VELOX_DEFINE_CLASS_NAME(HashTableSerializedData);
 
+  using Ptr = std::shared_ptr<const HashTableSerializedData>;
+
   folly::dynamic metadata{folly::dynamic::object};
   std::vector<std::string> rows;
 
@@ -137,7 +140,9 @@ struct HashTableSerializedData : public velox::ISerializable {
 
   folly::dynamic serialize() const override;
 
-  static HashTableSerializedData create(const folly::dynamic& obj);
+  static HashTableSerializedData decode(const folly::dynamic& obj);
+
+  static Ptr create(const folly::dynamic& obj);
 
   static void registerSerDe();
 };

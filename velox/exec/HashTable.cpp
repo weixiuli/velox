@@ -51,7 +51,7 @@ folly::dynamic HashTableSerializedData::serialize() const {
   return obj;
 }
 
-HashTableSerializedData HashTableSerializedData::create(
+HashTableSerializedData HashTableSerializedData::decode(
     const folly::dynamic& obj) {
   VELOX_CHECK(obj.isObject(), "HashTableSerializedData expects an object");
   VELOX_CHECK(
@@ -86,6 +86,11 @@ HashTableSerializedData HashTableSerializedData::create(
   return data;
 }
 
+HashTableSerializedData::Ptr HashTableSerializedData::create(
+    const folly::dynamic& obj) {
+  return std::make_shared<HashTableSerializedData>(decode(obj));
+}
+
 void HashTableSerializedData::registerSerDe() {
   std::call_once(kRegisterHashTableSerializedDataFlag, []() {
     auto& registry = DeserializationRegistryForSharedPtr();
@@ -93,8 +98,7 @@ void HashTableSerializedData::registerSerDe() {
         HashTableSerializedData::getClassName(),
         [](const folly::dynamic& obj)
             -> std::shared_ptr<const ISerializable> {
-          return std::make_shared<HashTableSerializedData>(
-              HashTableSerializedData::create(obj));
+          return HashTableSerializedData::create(obj);
         });
   });
 }
