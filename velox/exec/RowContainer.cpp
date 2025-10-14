@@ -750,7 +750,10 @@ void RowContainer::storeSerializedRow(
     vector_size_t index,
     char* row) {
   VELOX_CHECK(!vector.isNullAt(index));
-  const auto serialized = vector.valueAt(index);
+  storeSerializedRow(vector.valueAt(index), row);
+}
+
+void RowContainer::storeSerializedRow(StringView serialized, char* row) {
   size_t offset = 0;
 
   ::memcpy(row + rowColumns_[0].nullByte(), serialized.data(), flagBytes_);
@@ -769,6 +772,8 @@ void RowContainer::storeSerializedRow(
     }
     updateColumnStats(row, i);
   }
+
+  VELOX_DCHECK_EQ(serialized.size(), offset);
 }
 
 void RowContainer::extractString(

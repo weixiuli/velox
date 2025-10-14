@@ -15,12 +15,19 @@
  */
 #pragma once
 
+#include <folly/dynamic.h>
+#include <memory>
+#include <string>
+#include <vector>
+
 #include "velox/common/base/Portability.h"
+#include "velox/common/base/ClassName.h"
 #include "velox/common/memory/MemoryAllocator.h"
 #include "velox/exec/OneWayStatusFlag.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/RowContainer.h"
 #include "velox/exec/VectorHasher.h"
+#include "velox/common/serialization/Serializable.h"
 
 namespace facebook::velox::exec {
 
@@ -112,6 +119,80 @@ struct HashTableStats {
   int64_t numTombstones{0};
 };
 
+/// Serialized representation of a HashTable. `metadata` encodes table
+/// configuration (key channels, types, hash mode, etc.) and `rows` contains
+/// serialized row payloads produced by RowContainer::extractSerializedRows.
+struct HashTableSerializedData : public velox::ISerializable {
+  VELOX_DEFINE_CLASS_NAME(HashTableSerializedData);
+
+  using Ptr = std::shared_ptr<const HashTableSerializedData>;
+
+  folly::dynamic metadata{folly::dynamic::object};
+  std::vector<std::string> rows;
+
+  bool empty() const {
+    return rows.empty();
+  }
+
+  size_t rowCount() const {
+    return rows.size();
+  }
+
+  folly::dynamic serialize() const override;
+
+  static HashTableSerializedData decode(const folly::dynamic& obj);
+
+  static Ptr create(const folly::dynamic& obj);
+
+  static void registerSerDe();
+};
+
+/// Configuration for building a hash table outside of the Operator pipeline.
+///
+/// A Gluten driver can use this specification to construct a hash table from a
+/// set of columnar batches, serialize the result with
+/// BaseHashTable::serialize(), and ship the portable representation to Spark
+/// executors.
+struct HashTableBuildConfig {
+  /// Types for each join key in the build side input. Must align 1:1 with
+  /// 'keyChannels'.
+  std::vector<TypePtr> keyTypes;
+
+  /// Channel indices for each join key column within the provided batches.
+  std::vector<column_index_t> keyChannels;
+
+  /// Types for each dependent (non-key) build column stored in the hash table.
+  /// Aligns 1:1 with 'dependentChannels'.
+  std::vector<TypePtr> dependentTypes;
+
+  /// Channel indices for dependent columns within the provided batches. These
+  /// values are stored after the key columns in the hash table's RowContainer.
+  std::vector<column_index_t> dependentChannels;
+
+  /// If true, rows with null keys are ignored during the build.
+  bool ignoreNullKeys{false};
+
+  /// Whether duplicate keys are allowed in the build side (e.g. for inner
+  /// joins). If false, repeated keys are ignored.
+  bool allowDuplicates{true};
+
+  /// Whether to track a "probed" flag per build row. Required for joins that
+  /// need to know if a build row was matched (e.g. right/full joins).
+  bool hasProbedFlag{false};
+
+  /// Minimum table size before the join build considers parallelization.
+  uint32_t minTableSizeForParallelJoinBuild{0};
+};
+
+/// Builds a join hash table using the provided 'config' and input 'batches'.
+/// The resulting table is ready to be serialized with BaseHashTable::serialize
+/// and transferred to executors for deserialization via
+/// BaseHashTable::deserialize.
+std::unique_ptr<BaseHashTable> buildHashTable(
+    const HashTableBuildConfig& config,
+    const std::vector<RowVectorPtr>& batches,
+    memory::MemoryPool* pool);
+
 struct ParallelJoinBuildStats {
   std::vector<CpuWallTiming> partitionTimings;
   std::vector<CpuWallTiming> buildTimings;
@@ -158,6 +239,16 @@ class BaseHashTable {
 
   /// Returns the string of the given 'mode'.
   static std::string modeString(HashMode mode);
+
+  /// Serializes the hash table into a portable representation that can be
+  /// reconstituted using BaseHashTable::deserialize().
+  HashTableSerializedData serialize() const;
+
+  /// Restores a hash table from serialized representation using the provided
+  /// memory pool.
+  static std::unique_ptr<BaseHashTable> deserialize(
+      const HashTableSerializedData& serialized,
+      memory::MemoryPool* pool);
 
   /// Keeps track of results returned from a join table. One batch of keys can
   /// produce multiple batches of results. This is initialized from HashLookup,
@@ -618,6 +709,15 @@ class HashTable : public BaseHashTable {
       const RowVectorPtr& input,
       SelectivityVector& rows,
       bool decodeAndRemoveNulls) override;
+
+  /// Serializes table metadata and row contents into a transferable format.
+  HashTableSerializedData serialize() const;
+
+  /// Reconstructs a hash table instance from serialized data and metadata.
+  static std::unique_ptr<HashTable> deserialize(
+      const HashTableSerializedData& serialized,
+      const folly::dynamic& metadata,
+      memory::MemoryPool* pool);
 
   void prepareForGroupProbe(
       HashLookup& lookup,
