@@ -21,13 +21,66 @@
 #include "velox/common/base/SimdUtil.h"
 #include "velox/common/process/ProcessBase.h"
 #include "velox/common/process/TraceContext.h"
+#include "velox/common/serialization/Serializable.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/OperatorUtils.h"
+#include "velox/type/TypeFactories.h"
+#include "velox/vector/FlatVector.h"
 #include "velox/vector/VectorTypeUtils.h"
+
+#include <array>
+#include <limits>
+#include <string_view>
+#include <folly/IOBuf.h>
+#include <folly/io/Cursor.h>
+#include <folly/io/IOBufQueue.h>
+#include <folly/json.h>
 
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
+namespace {
+constexpr std::string_view kHashTableMagic{"HTBL", 4};
+constexpr uint32_t kHashTableSerializationVersion = 1;
+
+void appendUint32(folly::IOBufQueue& queue, uint32_t value) {
+  std::array<char, sizeof(uint32_t)> bytes;
+  bytes[0] = static_cast<char>(value & 0xFF);
+  bytes[1] = static_cast<char>((value >> 8) & 0xFF);
+  bytes[2] = static_cast<char>((value >> 16) & 0xFF);
+  bytes[3] = static_cast<char>((value >> 24) & 0xFF);
+  queue.append(bytes.data(), bytes.size());
+}
+
+void appendUint64(folly::IOBufQueue& queue, uint64_t value) {
+  std::array<char, sizeof(uint64_t)> bytes;
+  for (int i = 0; i < 8; ++i) {
+    bytes[i] = static_cast<char>((value >> (i * 8)) & 0xFF);
+  }
+  queue.append(bytes.data(), bytes.size());
+}
+
+uint32_t readUint32(folly::io::Cursor& cursor) {
+  std::array<uint8_t, sizeof(uint32_t)> bytes;
+  cursor.pull(bytes.data(), bytes.size());
+  uint32_t result = 0;
+  for (int i = 0; i < 4; ++i) {
+    result |= static_cast<uint32_t>(bytes[i]) << (i * 8);
+  }
+  return result;
+}
+
+uint64_t readUint64(folly::io::Cursor& cursor) {
+  std::array<uint8_t, sizeof(uint64_t)> bytes;
+  cursor.pull(bytes.data(), bytes.size());
+  uint64_t result = 0;
+  for (int i = 0; i < 8; ++i) {
+    result |= static_cast<uint64_t>(bytes[i]) << (i * 8);
+  }
+  return result;
+}
+} // namespace
+
 // static
 std::string BaseHashTable::modeString(HashMode mode) {
   switch (mode) {
@@ -1967,6 +2020,92 @@ int32_t HashTable<ignoreNullKeys>::listAllRows(
   return listRows<RowContainer::ProbeType::kAll>(iter, maxRows, maxBytes, rows);
 }
 
+template <bool ignoreNullKeys>
+std::unique_ptr<folly::IOBuf> HashTable<ignoreNullKeys>::serialize() const {
+  VELOX_CHECK(
+      isJoinBuild_,
+      "Serialization is currently supported only for join hash tables");
+  VELOX_CHECK(
+      rows_->accumulators().empty(),
+      "Serialization is not supported for aggregation hash tables");
+
+  folly::dynamic metadata = folly::dynamic::object;
+  metadata["ignoreNullKeys"] = ignoreNullKeys;
+  metadata["isJoinBuild"] = isJoinBuild_;
+  metadata["allowDuplicates"] = rows_->nextOffset() != 0;
+  metadata["hasProbedFlag"] = rows_->probedFlagOffset() != 0;
+  metadata["minTableSizeForParallelJoinBuild"] =
+      minTableSizeForParallelJoinBuild_;
+  metadata["disableRangeArrayHash"] = disableRangeArrayHash_;
+  metadata["hashMode"] = BaseHashTable::modeString(hashMode_);
+
+  metadata["keyTypes"] =
+      velox::ISerializable::serialize(rows_->keyTypes());
+
+  std::vector<TypePtr> dependentTypes;
+  const auto& columnTypes = rows_->columnTypes();
+  const auto keyCount = rows_->keyTypes().size();
+  dependentTypes.reserve(columnTypes.size() - keyCount);
+  for (size_t i = keyCount; i < columnTypes.size(); ++i) {
+    dependentTypes.push_back(columnTypes[i]);
+  }
+  metadata["dependentTypes"] =
+      velox::ISerializable::serialize(dependentTypes);
+
+  folly::dynamic hashers = folly::dynamic::array;
+  for (const auto& hasher : hashers_) {
+    folly::dynamic entry = folly::dynamic::object;
+    entry["channel"] = hasher->channel();
+    entry["type"] = velox::ISerializable::serialize(hasher->type());
+    hashers.push_back(std::move(entry));
+  }
+  metadata["hashers"] = std::move(hashers);
+
+  const std::string metadataJson = folly::json::serialize(metadata);
+  VELOX_CHECK_LE(
+      metadataJson.size(),
+      static_cast<size_t>(std::numeric_limits<uint32_t>::max()),
+      "Serialized metadata too large");
+
+  folly::IOBufQueue queue(folly::IOBufQueue::cacheChainLength());
+  queue.append(kHashTableMagic.data(), kHashTableMagic.size());
+  appendUint32(queue, kHashTableSerializationVersion);
+  appendUint32(queue, static_cast<uint32_t>(metadataJson.size()));
+  queue.append(metadataJson.data(), metadataJson.size());
+
+  uint64_t totalRows = 0;
+  auto containers = allRows();
+  for (auto* container : containers) {
+    totalRows += container->numRows();
+  }
+  appendUint64(queue, totalRows);
+
+  constexpr int32_t kBatchSize = 1024;
+  std::array<char*, kBatchSize> rowPointers;
+  for (auto* container : containers) {
+    RowContainerIterator iterator;
+    while (auto num = container->listRows(
+               &iterator, kBatchSize, RowContainer::kUnlimited, rowPointers.data())) {
+      auto serializedRows = BaseVector::create<FlatVector<StringView>>(
+          VARBINARY(), num, pool_);
+      container->extractSerializedRows(
+          folly::Range(rowPointers.data(), num), serializedRows);
+      auto* flat = serializedRows->as<FlatVector<StringView>>();
+      for (int32_t i = 0; i < num; ++i) {
+        const auto rowData = flat->valueAt(i);
+        VELOX_CHECK_LE(
+            rowData.size(),
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max()),
+            "Serialized row too large");
+        appendUint32(queue, static_cast<uint32_t>(rowData.size()));
+        queue.append(folly::IOBuf::copyBuffer(rowData.data(), rowData.size()));
+      }
+    }
+  }
+
+  return queue.move();
+}
+
 template <>
 int32_t HashTable<false>::listNullKeyRows(
     NullKeyRowsIterator* iter,
@@ -2116,6 +2255,153 @@ void HashTable<ignoreNullKeys>::checkConsistency() const {
 
 template class HashTable<true>;
 template class HashTable<false>;
+
+namespace {
+
+template <bool ignoreNullKeys>
+std::unique_ptr<HashTable<ignoreNullKeys>> deserializeHashTable(
+    const folly::dynamic& metadata,
+    folly::io::Cursor& cursor,
+    uint64_t expectedRows,
+    memory::MemoryPool* pool) {
+  VELOX_CHECK(
+      metadata.at("isJoinBuild").asBool(),
+      "Serialization currently supports only join hash tables");
+
+  auto dependentTypes =
+      velox::ISerializable::deserialize<std::vector<Type>>(
+          metadata.at("dependentTypes"));
+
+  std::vector<std::unique_ptr<VectorHasher>> hashers;
+  for (const auto& hasherMeta : metadata.at("hashers")) {
+    auto type =
+        velox::ISerializable::deserialize<Type>(hasherMeta.at("type"));
+    column_index_t channel = hasherMeta.at("channel").asInt();
+    hashers.push_back(VectorHasher::create(type, channel));
+  }
+
+  const bool allowDuplicates = metadata.at("allowDuplicates").asBool();
+  const bool hasProbedFlag = metadata.at("hasProbedFlag").asBool();
+  const int32_t minTableSize =
+      metadata.at("minTableSizeForParallelJoinBuild").asInt();
+
+  auto table = std::make_unique<HashTable<ignoreNullKeys>>(
+      std::move(hashers),
+      std::vector<Accumulator>{},
+      dependentTypes,
+      allowDuplicates,
+      true,
+      hasProbedFlag,
+      minTableSize,
+      pool);
+
+  table->disableRangeArrayHash_ = metadata.at("disableRangeArrayHash").asBool();
+
+  for (uint64_t i = 0; i < expectedRows; ++i) {
+    uint32_t rowSize = readUint32(cursor);
+    VELOX_CHECK_LE(
+        rowSize,
+        cursor.totalLength(),
+        "Unexpected end of row data while rebuilding hash table");
+    auto* row = table->rows_->newRow();
+    auto available = cursor.peekBytes();
+    if (available.size() >= rowSize) {
+      StringView serializedRow(
+          reinterpret_cast<const char*>(available.data()), rowSize);
+      cursor.skip(rowSize);
+      table->rows_->storeSerializedRow(serializedRow, row);
+    } else {
+      std::string rowBuffer(rowSize, 0);
+      cursor.pull(rowBuffer.data(), rowSize);
+      StringView serializedRow(rowBuffer.data(), rowSize);
+      table->rows_->storeSerializedRow(serializedRow, row);
+    }
+  }
+
+  const auto remainingBytes = cursor.totalLength();
+  VELOX_CHECK_EQ(
+      remainingBytes,
+      0,
+      "Serialized hash table contains {} extra bytes",
+      remainingBytes);
+
+  table->columnHasNulls_.clear();
+  for (int32_t i = 0; i < table->rows_->columnTypes().size(); ++i) {
+    table->columnHasNulls_.push_back(table->rows_->columnHasNulls(i));
+  }
+
+  table->hashMode_ = BaseHashTable::HashMode::kHash;
+  table->rows_->disableNormalizedKeys();
+  table->table_ = nullptr;
+  table->capacity_ = 0;
+  table->sizeMask_ = 0;
+  table->bucketOffsetMask_ = 0;
+  table->numBuckets_ = 0;
+  table->numDistinct_ = 0;
+  table->numTombstones_ = 0;
+  table->numRehashes_ = 0;
+
+  table->checkSize(
+      expectedRows,
+      true,
+      BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  constexpr int32_t kBatchSize = 1024;
+  std::array<char*, kBatchSize> rows;
+  raw_vector<uint64_t> hashes(pool);
+  RowContainerIterator iterator;
+  while (auto num = table->rows_->listRows(
+             &iterator, kBatchSize, RowContainer::kUnlimited, rows.data())) {
+    hashes.resize(num);
+    bool ok = table->insertBatch(rows.data(), num, hashes, true);
+    VELOX_CHECK(ok, "Failed to rebuild hash table from serialized data");
+  }
+
+  return table;
+}
+
+} // namespace
+
+std::unique_ptr<BaseHashTable> BaseHashTable::deserialize(
+    const folly::IOBuf& serialized,
+    memory::MemoryPool* pool) {
+  VELOX_CHECK_NOT_NULL(pool, "Memory pool must be provided");
+  const auto serializedSize = serialized.computeChainDataLength();
+  VELOX_CHECK_GE(
+      serializedSize,
+      kHashTableMagic.size() + sizeof(uint32_t) * 2 + sizeof(uint64_t),
+      "Serialized hash table data is too small");
+
+  folly::io::Cursor cursor(&serialized);
+
+  auto header = cursor.readFixedString(kHashTableMagic.size());
+  VELOX_CHECK_EQ(
+      header,
+      kHashTableMagic,
+      "Invalid hash table serialization header");
+
+  const uint32_t version = readUint32(cursor);
+  VELOX_CHECK_EQ(
+      version,
+      kHashTableSerializationVersion,
+      "Unsupported hash table serialization version");
+
+  const uint32_t metadataSize = readUint32(cursor);
+  VELOX_CHECK_LE(
+      metadataSize,
+      cursor.totalLength(),
+      "Corrupted hash table data");
+
+  auto metadata = folly::parseJson(cursor.readFixedString(metadataSize));
+
+  const uint64_t numRows = readUint64(cursor);
+
+  const bool ignoreNullKeys = metadata.at("ignoreNullKeys").asBool();
+  if (ignoreNullKeys) {
+    return deserializeHashTable<true>(metadata, cursor, numRows, pool);
+  }
+  return deserializeHashTable<false>(metadata, cursor, numRows, pool);
+}
 
 namespace {
 void populateLookupRows(

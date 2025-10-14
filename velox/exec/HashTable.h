@@ -22,6 +22,10 @@
 #include "velox/exec/RowContainer.h"
 #include "velox/exec/VectorHasher.h"
 
+#include <string>
+#include <string_view>
+#include <folly/IOBuf.h>
+
 namespace facebook::velox::exec {
 
 using PartitionBoundIndexType = int64_t;
@@ -378,6 +382,15 @@ class BaseHashTable {
   /// Returns a brief description for use in debugging.
   virtual std::string toString() = 0;
 
+  /// Serializes the hash table into a binary representation backed by a
+  /// folly::IOBuf chain.
+  virtual std::unique_ptr<folly::IOBuf> serialize() const = 0;
+
+  /// Deserializes a hash table from a buffer produced by serialize().
+  static std::unique_ptr<BaseHashTable> deserialize(
+      const folly::IOBuf& serialized,
+      memory::MemoryPool* pool);
+
   const std::vector<std::unique_ptr<VectorHasher>>& hashers() const {
     return hashers_;
   }
@@ -551,6 +564,8 @@ class HashTable : public BaseHashTable {
       int32_t maxRows,
       uint64_t maxBytes,
       char** rows) override;
+
+  std::unique_ptr<folly::IOBuf> serialize() const override;
 
   int32_t listNullKeyRows(
       NullKeyRowsIterator* iter,

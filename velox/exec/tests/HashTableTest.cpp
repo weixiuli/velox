@@ -27,6 +27,8 @@
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <array>
 #include <memory>
 
 using namespace facebook::velox;
@@ -378,6 +380,56 @@ class HashTableTest : public testing::TestWithParam<bool>,
       }
       position = (position + delta) & mask;
       ++delta;
+    }
+    return rows;
+  }
+
+  template <bool ignoreNullKeys>
+  void testSerializationRoundTrip() {
+    auto buildType = ROW({"k", "v"}, {BIGINT(), BIGINT()});
+    std::vector<std::unique_ptr<VectorHasher>> hashers;
+    hashers.emplace_back(std::make_unique<VectorHasher>(BIGINT(), 0));
+
+    auto table = HashTable<ignoreNullKeys>::createForJoin(
+        std::move(hashers), std::vector<TypePtr>{BIGINT()}, true, false, 1'000, pool());
+
+    std::vector<RowVectorPtr> batches;
+    makeRows(64, 1, 0, buildType, batches);
+    copyVectorsToTable(batches, 0, table.get());
+    table->prepareJoinTable(
+        {}, BaseHashTable::kNoSpillInputStartPartitionBit, executor_.get());
+
+    auto serialized = table->serialize();
+    auto restored = BaseHashTable::deserialize(*serialized, pool());
+
+    auto expected = collectJoinRows(table.get());
+    auto actual = collectJoinRows(restored.get());
+    std::sort(expected.begin(), expected.end());
+    std::sort(actual.begin(), actual.end());
+    ASSERT_EQ(expected, actual);
+    ASSERT_EQ(restored->rows()->numRows(), table->rows()->numRows());
+
+    if constexpr (ignoreNullKeys) {
+      ASSERT_NE(dynamic_cast<HashTable<true>*>(restored.get()), nullptr);
+    } else {
+      ASSERT_NE(dynamic_cast<HashTable<false>*>(restored.get()), nullptr);
+    }
+  }
+
+  std::vector<std::pair<int64_t, int64_t>> collectJoinRows(BaseHashTable* table) {
+    std::vector<std::pair<int64_t, int64_t>> rows;
+    constexpr int32_t kBatchSize = 256;
+    std::array<char*, kBatchSize> rowPointers;
+    RowContainerIterator iterator;
+    while (auto num = table->rows()->listRows(
+               &iterator, kBatchSize, RowContainer::kUnlimited, rowPointers.data())) {
+      auto keys = BaseVector::create<FlatVector<int64_t>>(BIGINT(), num, pool());
+      table->rows()->extractColumn(rowPointers.data(), num, 0, keys);
+      auto payload = BaseVector::create<FlatVector<int64_t>>(BIGINT(), num, pool());
+      table->rows()->extractColumn(rowPointers.data(), num, 1, payload);
+      for (int32_t i = 0; i < num; ++i) {
+        rows.emplace_back(keys->valueAt(i), payload->valueAt(i));
+      }
     }
     return rows;
   }
@@ -1268,6 +1320,11 @@ TEST_P(HashTableTest, toStringMultipleKeys) {
   table->prepareJoinTable({}, BaseHashTable::kNoSpillInputStartPartitionBit);
 
   ASSERT_NO_THROW(table->toString());
+}
+
+TEST_P(HashTableTest, serializeDeserializeHashTable) {
+  testSerializationRoundTrip<false>();
+  testSerializationRoundTrip<true>();
 }
 
 TEST(HashTableTest, tableInsertPartitionInfo) {
