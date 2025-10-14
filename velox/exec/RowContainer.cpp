@@ -745,30 +745,58 @@ void RowContainer::extractSerializedRows(
   VELOX_CHECK_EQ(totalWritten, totalBytes);
 }
 
+void RowContainer::storeSerializedRow(StringView serialized, char* row) {
+  size_t offset = 0;
+
+  if (flagBytes_ > 0) {
+    ::memcpy(row + rowColumns_[0].nullByte(), serialized.data(), flagBytes_);
+    offset += flagBytes_;
+  }
+
+  if (rowSizeOffset_) {
+    RowSizeTracker tracker(row[rowSizeOffset_], *stringAllocator_);
+    for (auto i = 0; i < types_.size(); ++i) {
+      const auto& type = types_[i];
+      if (type->isFixedWidth()) {
+        const auto size = typeKindSize(type->kind());
+        ::memcpy(row + rowColumns_[i].offset(), serialized.data() + offset, size);
+        offset += size;
+      } else {
+        const auto size = storeVariableSizeAt(serialized.data() + offset, row, i);
+        offset += size;
+      }
+      updateColumnStats(row, i);
+    }
+  } else {
+    for (auto i = 0; i < types_.size(); ++i) {
+      const auto& type = types_[i];
+      if (type->isFixedWidth()) {
+        const auto size = typeKindSize(type->kind());
+        ::memcpy(row + rowColumns_[i].offset(), serialized.data() + offset, size);
+        offset += size;
+      } else {
+        const auto size = storeVariableSizeAt(serialized.data() + offset, row, i);
+        offset += size;
+      }
+      updateColumnStats(row, i);
+    }
+  }
+
+  VELOX_CHECK_EQ(
+      offset,
+      serialized.size(),
+      "Serialized row contains {} extra bytes",
+      serialized.size() - offset);
+}
+
 void RowContainer::storeSerializedRow(
     const FlatVector<StringView>& vector,
     vector_size_t index,
     char* row) {
   VELOX_CHECK(!vector.isNullAt(index));
   const auto serialized = vector.valueAt(index);
-  size_t offset = 0;
 
-  ::memcpy(row + rowColumns_[0].nullByte(), serialized.data(), flagBytes_);
-  offset += flagBytes_;
-
-  RowSizeTracker tracker(row[rowSizeOffset_], *stringAllocator_);
-  for (auto i = 0; i < types_.size(); ++i) {
-    const auto& type = types_[i];
-    if (type->isFixedWidth()) {
-      const auto size = typeKindSize(type->kind());
-      ::memcpy(row + rowColumns_[i].offset(), serialized.data() + offset, size);
-      offset += size;
-    } else {
-      const auto size = storeVariableSizeAt(serialized.data() + offset, row, i);
-      offset += size;
-    }
-    updateColumnStats(row, i);
-  }
+  storeSerializedRow(serialized, row);
 }
 
 void RowContainer::extractString(
