@@ -325,9 +325,10 @@ BaseHashTable::SerializedHashTable HashTable<ignoreNullKeys>::serialize() const 
   IOBufOutputStream output(*pool_);
   streamGroup.flush(&output);
   if (auto iobuf = output.getIOBuf()) {
-    result.serializedRows.reserve(iobuf->computeChainDataLength());
     folly::io::Cursor cursor(iobuf.get());
-    cursor.appendToString(&result.serializedRows);
+    const auto chainLength = cursor.totalLength();
+    result.serializedRows.resize(chainLength);
+    cursor.pull(result.serializedRows.data(), chainLength);
   }
   return result;
 }
