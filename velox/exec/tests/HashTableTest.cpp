@@ -22,6 +22,7 @@
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/VectorHasher.h"
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
+#include "velox/vector/VectorSerde.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
 #include <folly/executors/CPUThreadPoolExecutor.h>
@@ -1311,5 +1312,141 @@ TEST(HashTableTest, tableInsertPartitionInfo) {
   for (int i = 0; i < overflows.size(); ++i) {
     ASSERT_EQ(overflows[i], info.overflows[i]);
   }
+}
+
+class HashTableSerializationTest : public testing::Test, public VectorTestBase {
+ protected:
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance(
+        memory::MemoryManager::Options{});
+    facebook::velox::registerVectorSerde();
+  }
+
+  RowVectorPtr extractRows(
+      const BaseHashTable& table,
+      const RowTypePtr& rowType) {
+    auto* container = table.rows();
+    auto rowVector = std::dynamic_pointer_cast<RowVector>(
+        BaseVector::create(rowType, container->numRows(), pool()));
+    if (container->numRows() == 0) {
+      return rowVector;
+    }
+
+    for (auto i = 0; i < rowType->size(); ++i) {
+      rowVector->childAt(i)->resize(container->numRows());
+    }
+
+    std::vector<bool> columnHasNulls(rowType->size());
+    for (auto i = 0; i < rowType->size(); ++i) {
+      columnHasNulls[i] = container->columnHasNulls(i);
+    }
+
+    constexpr int32_t kBatch = 1024;
+    std::vector<char*> batch(kBatch);
+    RowContainerIterator iterator;
+    vector_size_t offset = 0;
+    while (auto numRows = container->listRows(
+               &iterator,
+               kBatch,
+               RowContainer::kUnlimited,
+               batch.data())) {
+      const auto* rawRows = reinterpret_cast<const char* const*>(batch.data());
+      for (auto column = 0; column < rowType->size(); ++column) {
+        RowContainer::extractColumn(
+            rawRows,
+            numRows,
+            container->columnAt(column),
+            columnHasNulls[column],
+            offset,
+            rowVector->childAt(column));
+      }
+      offset += numRows;
+    }
+
+    return rowVector;
+  }
+};
+
+TEST_F(HashTableSerializationTest, serializeDeserializeRoundTrip) {
+  auto rowType = ROW({"c0", "c1", "c2"}, {BIGINT(), VARCHAR(), INTEGER()});
+  auto buildVector = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 2, 4}),
+      makeFlatVector<std::string>({"a", "b", "b", "d"}),
+      makeNullableFlatVector<int32_t>({std::nullopt, 10, 20, 30}),
+  });
+
+  BaseHashTable::HashTableBuildInfo info;
+  info.tableType = rowType;
+  info.numKeys = 2;
+  info.ignoreNullKeys = false;
+  info.allowDuplicates = true;
+  info.isJoinBuild = true;
+  info.hasProbedFlag = false;
+
+  auto table = BaseHashTable::buildHashTable(info, buildVector, pool());
+  ASSERT_EQ(table->rows()->numRows(), buildVector->size());
+
+  auto extracted = extractRows(*table, rowType);
+  assertEqualVectors(buildVector, extracted);
+
+  auto serialized = table->serialize();
+  EXPECT_TRUE(serialized.info.tableType->equivalent(*info.tableType));
+  EXPECT_EQ(serialized.info.numKeys, info.numKeys);
+  EXPECT_EQ(serialized.info.ignoreNullKeys, info.ignoreNullKeys);
+  EXPECT_EQ(serialized.info.allowDuplicates, info.allowDuplicates);
+  EXPECT_EQ(serialized.info.isJoinBuild, info.isJoinBuild);
+  EXPECT_EQ(serialized.info.hasProbedFlag, info.hasProbedFlag);
+  EXPECT_EQ(
+      serialized.info.minTableSizeForParallelJoinBuild,
+      info.minTableSizeForParallelJoinBuild);
+  EXPECT_FALSE(serialized.serializedRows.empty());
+
+  auto restored = BaseHashTable::deserialize(serialized, pool());
+  ASSERT_EQ(restored->rows()->numRows(), table->rows()->numRows());
+  EXPECT_EQ(restored->hashMode(), table->hashMode());
+  EXPECT_EQ(restored->hasDuplicateKeys(), table->hasDuplicateKeys());
+
+  auto restoredRows = extractRows(*restored, serialized.info.tableType);
+  assertEqualVectors(extracted, restoredRows);
+
+  auto reserialized = restored->serialize();
+  EXPECT_TRUE(
+      reserialized.info.tableType->equivalent(*serialized.info.tableType));
+  EXPECT_EQ(reserialized.info.numKeys, serialized.info.numKeys);
+  EXPECT_EQ(reserialized.info.ignoreNullKeys, serialized.info.ignoreNullKeys);
+  EXPECT_EQ(
+      reserialized.info.allowDuplicates, serialized.info.allowDuplicates);
+  EXPECT_EQ(reserialized.info.isJoinBuild, serialized.info.isJoinBuild);
+  EXPECT_EQ(reserialized.info.hasProbedFlag, serialized.info.hasProbedFlag);
+  EXPECT_EQ(
+      reserialized.info.minTableSizeForParallelJoinBuild,
+      serialized.info.minTableSizeForParallelJoinBuild);
+  EXPECT_EQ(reserialized.serializedRows, serialized.serializedRows);
+}
+
+TEST_F(HashTableSerializationTest, handlesEmptyInput) {
+  auto rowType = ROW({"c0", "c1"}, {BIGINT(), VARCHAR()});
+  auto buildVector = makeRowVector({
+      makeFlatVector<int64_t>({}),
+      makeFlatVector<std::string>({}),
+  });
+
+  BaseHashTable::HashTableBuildInfo info;
+  info.tableType = rowType;
+  info.numKeys = 2;
+  info.ignoreNullKeys = false;
+  info.allowDuplicates = false;
+  info.isJoinBuild = true;
+
+  auto table = BaseHashTable::buildHashTable(info, buildVector, pool());
+  ASSERT_EQ(table->rows()->numRows(), 0);
+
+  auto serialized = table->serialize();
+  EXPECT_TRUE(serialized.serializedRows.empty());
+  auto restored = BaseHashTable::deserialize(serialized, pool());
+  ASSERT_EQ(restored->rows()->numRows(), 0);
+  EXPECT_EQ(restored->hashMode(), table->hashMode());
+  auto restoredRows = extractRows(*restored, serialized.info.tableType);
+  assertEqualVectors(restoredRows, buildVector);
 }
 } // namespace facebook::velox::exec::test
