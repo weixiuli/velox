@@ -21,6 +21,9 @@
 #include "velox/exec/Operator.h"
 #include "velox/exec/RowContainer.h"
 #include "velox/exec/VectorHasher.h"
+#include "velox/vector/ComplexVector.h"
+
+#include <string>
 
 namespace facebook::velox::exec {
 
@@ -213,6 +216,21 @@ class BaseHashTable {
     char* nextHit;
   };
 
+  struct HashTableBuildInfo {
+    RowTypePtr tableType;
+    uint32_t numKeys{0};
+    bool ignoreNullKeys{false};
+    bool allowDuplicates{false};
+    bool isJoinBuild{false};
+    bool hasProbedFlag{false};
+    uint32_t minTableSizeForParallelJoinBuild{0};
+  };
+
+  struct SerializedHashTable {
+    HashTableBuildInfo info;
+    std::string serializedRows;
+  };
+
   /// Takes ownership of 'hashers'. These are used to keep key-level
   /// encodings like distinct values, ranges. These are stateful for
   /// kArray and kNormalizedKey hash modes and track the data
@@ -390,6 +408,17 @@ class BaseHashTable {
   /// join use.
   virtual std::vector<RowContainer*> allRows() const = 0;
 
+  virtual SerializedHashTable serialize() const = 0;
+
+  static std::unique_ptr<BaseHashTable> buildHashTable(
+      const HashTableBuildInfo& info,
+      const RowVectorPtr& rows,
+      memory::MemoryPool* pool);
+
+  static std::unique_ptr<BaseHashTable> deserialize(
+      const SerializedHashTable& serialized,
+      memory::MemoryPool* pool);
+
   /// Static functions for processing internals. Public because used in
   /// structs that define probe and insert algorithms.
 
@@ -521,6 +550,17 @@ class HashTable : public BaseHashTable {
         minTableSizeForParallelJoinBuild,
         pool);
   }
+
+  SerializedHashTable serialize() const override;
+
+  static std::unique_ptr<HashTable> createFromRows(
+      const HashTableBuildInfo& info,
+      const RowVectorPtr& rows,
+      memory::MemoryPool* pool);
+
+  static std::unique_ptr<HashTable> createFromSerialized(
+      const SerializedHashTable& serialized,
+      memory::MemoryPool* pool);
 
   void groupProbe(HashLookup& lookup, int8_t spillInputStartPartitionBit)
       override;
@@ -689,6 +729,10 @@ class HashTable : public BaseHashTable {
   }
 
  private:
+  static std::unique_ptr<HashTable> createEmpty(
+      const HashTableBuildInfo& info,
+      memory::MemoryPool* pool);
+
   // Enables debug stats for collisions for debug build.
 #ifdef NDEBUG
   static constexpr bool kTrackLoads = false;
@@ -1037,6 +1081,8 @@ class HashTable : public BaseHashTable {
 
   int8_t sizeBits_;
   bool isJoinBuild_ = false;
+  const bool allowDuplicates_;
+  const bool hasProbedFlag_;
 
   // Set at join build time if the table has duplicates, meaning that
   // the join can be cardinality increasing. Atomic for tsan because
