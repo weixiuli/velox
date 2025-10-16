@@ -733,6 +733,16 @@ class HashTable : public BaseHashTable {
       const HashTableBuildInfo& info,
       memory::MemoryPool* pool);
 
+  static void populateContainerFromVector(
+      HashTable& table,
+      const RowVectorPtr& rowsVector);
+
+  static void updateHasherStatistics(
+      HashTable& table,
+      const RowVectorPtr& rowsVector);
+
+  void finalizeTableBuild();
+
   // Enables debug stats for collisions for debug build.
 #ifdef NDEBUG
   static constexpr bool kTrackLoads = false;

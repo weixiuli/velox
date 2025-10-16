@@ -92,71 +92,6 @@ RowVectorPtr extractRowsToVector(
   return rowVector;
 }
 
-template <bool ignoreNullKeys>
-void populateContainerFromVector(
-    HashTable<ignoreNullKeys>& table,
-    const RowVectorPtr& rowsVector) {
-  if (!rowsVector || rowsVector->size() == 0) {
-    return;
-  }
-
-  auto* container = table.rows_.get();
-  const vector_size_t numRows = rowsVector->size();
-  std::vector<char*> newRows(numRows);
-  const auto nextOffset = container->nextOffset();
-  for (vector_size_t i = 0; i < numRows; ++i) {
-    char* row = container->newRow();
-    if (nextOffset) {
-      *reinterpret_cast<char**>(row + nextOffset) = nullptr;
-    }
-    newRows[i] = row;
-  }
-
-  SelectivityVector all(numRows);
-  DecodedVector decoded;
-  for (int32_t column = 0; column < rowsVector->type()->size(); ++column) {
-    decoded.decode(*rowsVector->childAt(column), all);
-    container->store(
-        decoded,
-        folly::Range<char**>(newRows.data(), numRows),
-        column);
-  }
-}
-
-template <bool ignoreNullKeys>
-void updateHasherStatistics(
-    HashTable<ignoreNullKeys>& table,
-    const RowVectorPtr& rowsVector) {
-  if (!rowsVector || rowsVector->size() == 0) {
-    return;
-  }
-
-  raw_vector<uint64_t> hashes(table.pool_);
-  SelectivityVector all(rowsVector->size());
-  hashes.resize(all.end());
-  for (auto i = 0; i < table.hashers_.size(); ++i) {
-    auto& hasher = table.hashers_[i];
-    hasher->decode(*rowsVector->childAt(i), all);
-    hasher->computeValueIds(all, hashes);
-  }
-}
-
-template <bool ignoreNullKeys>
-void finalizeTableBuild(HashTable<ignoreNullKeys>& table) {
-  auto* container = table.rows_.get();
-  table.columnHasNulls_.resize(container->columnTypes().size());
-  for (auto i = 0; i < container->columnTypes().size(); ++i) {
-    table.columnHasNulls_[i] = container->columnHasNulls(i);
-  }
-  table.numDistinct_ = container->numRows();
-  if (table.numDistinct_ == 0) {
-    return;
-  }
-
-  table.decideHashMode(
-      table.numDistinct_, BaseHashTable::kNoSpillInputStartPartitionBit);
-}
-
 } // namespace
 std::unique_ptr<BaseHashTable> BaseHashTable::buildHashTable(
     const HashTableBuildInfo& info,
@@ -263,14 +198,77 @@ std::unique_ptr<HashTable<ignoreNullKeys>> HashTable<ignoreNullKeys>::createEmpt
 }
 
 template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::populateContainerFromVector(
+    HashTable& table,
+    const RowVectorPtr& rowsVector) {
+  if (!rowsVector || rowsVector->size() == 0) {
+    return;
+  }
+
+  auto* container = table.rows_.get();
+  const vector_size_t numRows = rowsVector->size();
+  std::vector<char*> newRows(numRows);
+  const auto nextOffset = container->nextOffset();
+  for (vector_size_t i = 0; i < numRows; ++i) {
+    char* row = container->newRow();
+    if (nextOffset) {
+      *reinterpret_cast<char**>(row + nextOffset) = nullptr;
+    }
+    newRows[i] = row;
+  }
+
+  SelectivityVector all(numRows);
+  DecodedVector decoded;
+  for (int32_t column = 0; column < rowsVector->type()->size(); ++column) {
+    decoded.decode(*rowsVector->childAt(column), all);
+    container->store(
+        decoded,
+        folly::Range<char**>(newRows.data(), numRows),
+        column);
+  }
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::updateHasherStatistics(
+    HashTable& table,
+    const RowVectorPtr& rowsVector) {
+  if (!rowsVector || rowsVector->size() == 0) {
+    return;
+  }
+
+  raw_vector<uint64_t> hashes(table.pool_);
+  SelectivityVector all(rowsVector->size());
+  hashes.resize(all.end());
+  for (auto i = 0; i < table.hashers_.size(); ++i) {
+    auto& hasher = table.hashers_[i];
+    hasher->decode(*rowsVector->childAt(i), all);
+    hasher->computeValueIds(all, hashes);
+  }
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::finalizeTableBuild() {
+  columnHasNulls_.resize(rows_->columnTypes().size());
+  for (auto i = 0; i < rows_->columnTypes().size(); ++i) {
+    columnHasNulls_[i] = rows_->columnHasNulls(i);
+  }
+  numDistinct_ = rows_->numRows();
+  if (numDistinct_ == 0) {
+    return;
+  }
+
+  decideHashMode(numDistinct_, BaseHashTable::kNoSpillInputStartPartitionBit);
+}
+
+template <bool ignoreNullKeys>
 std::unique_ptr<HashTable<ignoreNullKeys>> HashTable<ignoreNullKeys>::createFromRows(
     const HashTableBuildInfo& info,
     const RowVectorPtr& rows,
     memory::MemoryPool* pool) {
   auto table = createEmpty(info, pool);
-  populateContainerFromVector(*table, rows);
-  updateHasherStatistics(*table, rows);
-  finalizeTableBuild(*table);
+  HashTable<ignoreNullKeys>::populateContainerFromVector(*table, rows);
+  HashTable<ignoreNullKeys>::updateHasherStatistics(*table, rows);
+  table->finalizeTableBuild();
   return table;
 }
 
@@ -298,9 +296,9 @@ HashTable<ignoreNullKeys>::createFromSerialized(
         BaseVector::create(serialized.info.tableType, 0, pool));
   }
 
-  populateContainerFromVector(*table, rowsVector);
-  updateHasherStatistics(*table, rowsVector);
-  finalizeTableBuild(*table);
+  HashTable<ignoreNullKeys>::populateContainerFromVector(*table, rowsVector);
+  HashTable<ignoreNullKeys>::updateHasherStatistics(*table, rowsVector);
+  table->finalizeTableBuild();
   return table;
 }
 
