@@ -25,9 +25,49 @@
 #include "velox/exec/OperatorUtils.h"
 #include "velox/vector/VectorTypeUtils.h"
 
+#include <array>
+#include <cstring>
+
+#include <folly/dynamic.h>
+#include <folly/json.h>
+
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
+namespace {
+
+constexpr uint32_t kHashTableSerializeMagic = 0x4854424c; // 'HTBL'
+constexpr uint32_t kHashTableSerializeVersion = 1;
+constexpr vector_size_t kSerializedRowBatchSize = 1024;
+
+RowTypePtr makeSerializedRowType(const std::vector<TypePtr>& types) {
+  std::vector<std::string> names;
+  names.reserve(types.size());
+  for (vector_size_t i = 0; i < types.size(); ++i) {
+    names.push_back(fmt::format("c{}", i));
+  }
+  return ROW(std::move(names), types);
+}
+
+template <typename T>
+void appendPod(std::string& out, T value) {
+  out.append(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+template <typename T>
+T readPod(const std::string& in, size_t& offset) {
+  VELOX_CHECK_LE(
+      offset + sizeof(T),
+      in.size(),
+      "Not enough bytes remaining while deserializing hash table");
+  T value;
+  std::memcpy(&value, in.data() + offset, sizeof(T));
+  offset += sizeof(T);
+  return value;
+}
+
+} // namespace
+
 // static
 std::string BaseHashTable::modeString(HashMode mode) {
   switch (mode) {
@@ -1946,6 +1986,217 @@ int32_t HashTable<ignoreNullKeys>::listNotProbedRows(
     char** rows) {
   return listRows<RowContainer::ProbeType::kNotProbed>(
       iter, maxRows, maxBytes, rows);
+}
+
+template <bool ignoreNullKeys>
+std::string HashTable<ignoreNullKeys>::serialize() const {
+  VELOX_CHECK(
+      isJoinBuild_,
+      "Hash table serialization currently supports only join build tables");
+  auto rowContainers = allRows();
+  VELOX_CHECK(!rowContainers.empty());
+
+  const auto& firstTypes = rowContainers.front()->columnTypes();
+  for (auto* container : rowContainers) {
+    const auto& types = container->columnTypes();
+    VELOX_CHECK_EQ(
+        types.size(),
+        firstTypes.size(),
+        "Row containers must have matching schema for serialization");
+    for (auto i = 0; i < types.size(); ++i) {
+      VELOX_CHECK(
+          types[i]->equivalent(*firstTypes[i]),
+          "Mismatched column type at index {} while serializing hash table",
+          i);
+    }
+  }
+
+  std::string out;
+  appendPod(out, kHashTableSerializeMagic);
+  appendPod(out, kHashTableSerializeVersion);
+  const uint8_t ignoreFlag = ignoreNullKeys ? 1 : 0;
+  const uint8_t allowDuplicatesFlag = rows_->nextOffset() > 0 ? 1 : 0;
+  const uint8_t probedFlag = rows_->probedFlagOffset() > 0 ? 1 : 0;
+  const uint8_t reserved = 0;
+  appendPod(out, ignoreFlag);
+  appendPod(out, allowDuplicatesFlag);
+  appendPod(out, probedFlag);
+  appendPod(out, reserved);
+  appendPod(out, minTableSizeForParallelJoinBuild_);
+  const uint32_t numKeys = hashers_.size();
+  appendPod(out, numKeys);
+  appendPod(out, static_cast<uint32_t>(firstTypes.size()));
+
+  uint64_t totalRows = 0;
+  for (auto* container : rowContainers) {
+    totalRows += container->numRows();
+  }
+  appendPod(out, totalRows);
+
+  auto rowType = makeSerializedRowType(firstTypes);
+  auto typeJson = folly::toJson(rowType->serialize());
+  appendPod(out, static_cast<uint32_t>(typeJson.size()));
+  out.append(typeJson.data(), typeJson.size());
+
+  std::array<char*, kSerializedRowBatchSize> rows;
+  for (auto* container : rowContainers) {
+    RowContainerIterator iterator;
+    while (auto numRows = container->listRows(
+               &iterator, kSerializedRowBatchSize, rows.data())) {
+      auto serialized = BaseVector::create(VARCHAR(), numRows, container->pool());
+      container->extractSerializedRows(
+          folly::Range<char**>(rows.data(), numRows), serialized);
+      auto flat = serialized->as<FlatVector<StringView>>();
+      for (vector_size_t i = 0; i < numRows; ++i) {
+        auto view = flat->valueAt(i);
+        appendPod(out, static_cast<uint32_t>(view.size()));
+        out.append(view.data(), view.size());
+      }
+    }
+  }
+  return out;
+}
+
+namespace {
+
+template <bool ignoreNullKeys>
+std::shared_ptr<BaseHashTable> deserializeHashTable(
+    const std::string& serialized,
+    size_t& offset,
+    memory::MemoryPool* pool,
+    const RowTypePtr& rowType,
+    uint32_t numKeys,
+    bool allowDuplicates,
+    bool hasProbedFlag,
+    uint32_t minTableSizeForParallelJoinBuild,
+    uint64_t numRows) {
+  std::vector<std::unique_ptr<VectorHasher>> hashers;
+  hashers.reserve(numKeys);
+  for (uint32_t i = 0; i < numKeys; ++i) {
+    hashers.emplace_back(VectorHasher::create(rowType->childAt(i), i));
+  }
+
+  std::vector<TypePtr> dependentTypes;
+  dependentTypes.reserve(rowType->size() - numKeys);
+  for (uint32_t i = numKeys; i < rowType->size(); ++i) {
+    dependentTypes.push_back(rowType->childAt(i));
+  }
+
+  auto tableUnique = HashTable<ignoreNullKeys>::createForJoin(
+      std::move(hashers),
+      dependentTypes,
+      allowDuplicates,
+      hasProbedFlag,
+      minTableSizeForParallelJoinBuild,
+      pool);
+
+  auto* rows = tableUnique->rows();
+  const auto nextOffset = rows->nextOffset();
+  auto serializedRow = BaseVector::create(VARCHAR(), 1, pool);
+  auto flat = serializedRow->as<FlatVector<StringView>>();
+  flat->resize(1);
+  for (uint64_t i = 0; i < numRows; ++i) {
+    const uint32_t rowSize = readPod<uint32_t>(serialized, offset);
+    VELOX_CHECK_LE(
+        offset + rowSize,
+        serialized.size(),
+        "Unexpected end of data while reading hash table rows");
+    const char* rowData = serialized.data() + offset;
+    offset += rowSize;
+    char* row = rows->newRow();
+    if (nextOffset) {
+      *reinterpret_cast<char**>(row + nextOffset) = nullptr;
+    }
+    flat->setNull(0, false);
+    flat->setNoCopy(0, StringView(rowData, rowSize));
+    rows->storeSerializedRow(*flat, 0, row);
+  }
+
+  tableUnique->prepareJoinTable(
+      {}, BaseHashTable::kNoSpillInputStartPartitionBit, nullptr);
+
+  auto tableShared =
+      std::shared_ptr<HashTable<ignoreNullKeys>>(std::move(tableUnique));
+  return std::static_pointer_cast<BaseHashTable>(tableShared);
+}
+
+} // namespace
+
+std::shared_ptr<BaseHashTable> BaseHashTable::deserialize(
+    const std::string& serialized,
+    memory::MemoryPool* pool) {
+  VELOX_CHECK_NOT_NULL(pool);
+  size_t offset = 0;
+  const auto magic = readPod<uint32_t>(serialized, offset);
+  VELOX_CHECK_EQ(
+      magic,
+      kHashTableSerializeMagic,
+      "Invalid hash table serialization header");
+  const auto version = readPod<uint32_t>(serialized, offset);
+  VELOX_CHECK_EQ(
+      version,
+      kHashTableSerializeVersion,
+      "Unsupported hash table serialization version: {}",
+      version);
+  const auto ignoreFlag = readPod<uint8_t>(serialized, offset);
+  const auto allowDuplicatesFlag = readPod<uint8_t>(serialized, offset);
+  const auto probedFlag = readPod<uint8_t>(serialized, offset);
+  (void)readPod<uint8_t>(serialized, offset); // reserved
+  const auto minTableSize = readPod<uint32_t>(serialized, offset);
+  const auto numKeys = readPod<uint32_t>(serialized, offset);
+  const auto numColumns = readPod<uint32_t>(serialized, offset);
+  const auto numRows = readPod<uint64_t>(serialized, offset);
+  const auto typeJsonSize = readPod<uint32_t>(serialized, offset);
+  VELOX_CHECK_LE(
+      offset + typeJsonSize,
+      serialized.size(),
+      "Invalid hash table serialization: truncated type information");
+  std::string typeJson(serialized.data() + offset, typeJsonSize);
+  offset += typeJsonSize;
+
+  auto typeDynamic = folly::parseJson(typeJson);
+  auto type = Type::create(typeDynamic);
+  auto rowType = std::dynamic_pointer_cast<const RowType>(type);
+  VELOX_CHECK_NOT_NULL(rowType, "Serialized hash table must use ROW type");
+  VELOX_CHECK_EQ(
+      rowType->size(),
+      numColumns,
+      "Mismatch between serialized column count and row type");
+  VELOX_CHECK_GE(
+      rowType->size(),
+      numKeys,
+      "Serialized hash table contains more keys than columns");
+
+  std::shared_ptr<BaseHashTable> table;
+  if (ignoreFlag) {
+    table = deserializeHashTable<true>(
+        serialized,
+        offset,
+        pool,
+        rowType,
+        numKeys,
+        allowDuplicatesFlag != 0,
+        probedFlag != 0,
+        minTableSize,
+        numRows);
+  } else {
+    table = deserializeHashTable<false>(
+        serialized,
+        offset,
+        pool,
+        rowType,
+        numKeys,
+        allowDuplicatesFlag != 0,
+        probedFlag != 0,
+        minTableSize,
+        numRows);
+  }
+
+  VELOX_CHECK_EQ(
+      offset,
+      serialized.size(),
+      "Unexpected trailing bytes in hash table serialization");
+  return table;
 }
 
 template <bool ignoreNullKeys>
