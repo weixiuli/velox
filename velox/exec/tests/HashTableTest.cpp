@@ -1291,7 +1291,8 @@ TEST_P(HashTableTest, builderSerializeRoundTrip) {
   auto serialized = table->serialize();
   auto restored = BaseHashTable::deserialize(serialized, pool());
 
-  auto gatherValues = [&](const std::shared_ptr<BaseHashTable>& tbl) {
+  auto gatherValues = [&](const std::shared_ptr<BaseHashTable>& tbl)
+      -> std::vector<int64_t> {
     HashLookup lookup(tbl->hashers(), pool());
     SelectivityVector rows(input->size());
     rows.setAll();
@@ -1301,13 +1302,16 @@ TEST_P(HashTableTest, builderSerializeRoundTrip) {
     std::vector<const char*> hits;
     hits.reserve(input->size());
     for (auto i = 0; i < input->size(); ++i) {
-      ASSERT_NE(lookup.hits[i], nullptr);
+      EXPECT_NE(lookup.hits[i], nullptr);
       hits.push_back(lookup.hits[i]);
     }
 
     auto values = BaseVector::create(BIGINT(), hits.size(), pool());
     tbl->rows()->extractColumn(
-        hits.data(), hits.size(), tbl->hashers().size(), values);
+        hits.data(),
+        static_cast<int32_t>(hits.size()),
+        static_cast<int32_t>(tbl->hashers().size()),
+        values);
     auto flat = values->as<FlatVector<int64_t>>();
     std::vector<int64_t> result(hits.size());
     for (auto i = 0; i < hits.size(); ++i) {
