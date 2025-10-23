@@ -16,10 +16,7 @@
 
 #include "velox/exec/HashTableBuilder.h"
 
-#include <algorithm>
-#include <numeric>
-
-#include <fmt/format.h>
+#include <unordered_set>
 
 #include "velox/vector/ComplexVector.h"
 
@@ -73,15 +70,25 @@ void HashTableBuilder::setupDecoders(const RowTypePtr& inputType) {
 
   std::vector<std::string> names;
   names.reserve(inputType->size());
+  std::vector<TypePtr> types;
+  types.reserve(inputType->size());
+  std::unordered_set<int32_t> keyChannels;
+  keyChannels.reserve(keyChannels_.size());
+  for (auto channel : keyChannels_) {
+    keyChannels.insert(channel);
+    names.emplace_back(inputType->nameOf(channel));
+    types.emplace_back(inputType->childAt(channel));
+  }
+
   for (vector_size_t i = 0; i < inputType->size(); ++i) {
-    names.push_back(fmt::format("c{}", i));
+    if (keyChannels.find(i) != keyChannels.end()) {
+      continue;
+    }
+    names.emplace_back(inputType->nameOf(i));
+    types.emplace_back(inputType->childAt(i));
   }
-  std::vector<TypePtr> childTypes;
-  childTypes.reserve(inputType_->size());
-  for (vector_size_t i = 0; i < inputType_->size(); ++i) {
-    childTypes.push_back(inputType_->childAt(i));
-  }
-  tableType_ = ROW(std::move(names), std::move(childTypes));
+
+  tableType_ = ROW(std::move(names), std::move(types));
 }
 
 void HashTableBuilder::setupTable(memory::MemoryPool* pool) {
