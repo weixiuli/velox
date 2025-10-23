@@ -40,7 +40,7 @@ HashTableBuilder::HashTableBuilder(
       allowDuplicates_(allowDuplicates),
       hasProbedFlag_(hasProbedFlag),
       minTableSizeForParallelJoinBuild_(minTableSizeForParallelJoinBuild),
-      hashes_(pool) {
+      hashes_(pool_) {
   VELOX_CHECK_NOT_NULL(pool_);
   VELOX_CHECK_NOT_NULL(inputType_);
   VELOX_CHECK(!keyChannels_.empty(), "Hash table requires at least one key");
