@@ -46,7 +46,12 @@ RowTypePtr makeSerializedRowType(const std::vector<TypePtr>& types) {
   for (vector_size_t i = 0; i < types.size(); ++i) {
     names.push_back(fmt::format("c{}", i));
   }
-  return ROW(std::move(names), types);
+  std::vector<TypePtr> children;
+  children.reserve(types.size());
+  for (auto& type : types) {
+    children.push_back(type);
+  }
+  return ROW(std::move(names), std::move(children));
 }
 
 template <typename T>
@@ -2046,7 +2051,7 @@ std::string HashTable<ignoreNullKeys>::serialize() const {
       auto serialized = BaseVector::create(VARCHAR(), numRows, container->pool());
       container->extractSerializedRows(
           folly::Range<char**>(rows.data(), numRows), serialized);
-      auto flat = serialized->as<FlatVector<StringView>>();
+      auto* flat = serialized->template as<FlatVector<StringView>>();
       for (vector_size_t i = 0; i < numRows; ++i) {
         auto view = flat->valueAt(i);
         appendPod(out, static_cast<uint32_t>(view.size()));
@@ -2093,7 +2098,7 @@ std::shared_ptr<BaseHashTable> deserializeHashTable(
   auto* rows = tableUnique->rows();
   const auto nextOffset = rows->nextOffset();
   auto serializedRow = BaseVector::create(VARCHAR(), 1, pool);
-  auto flat = serializedRow->as<FlatVector<StringView>>();
+  auto* flat = serializedRow->template as<FlatVector<StringView>>();
   flat->resize(1);
   for (uint64_t i = 0; i < numRows; ++i) {
     const uint32_t rowSize = readPod<uint32_t>(serialized, offset);

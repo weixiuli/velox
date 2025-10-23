@@ -76,7 +76,12 @@ void HashTableBuilder::setupDecoders(const RowTypePtr& inputType) {
   for (vector_size_t i = 0; i < inputType->size(); ++i) {
     names.push_back(fmt::format("c{}", i));
   }
-  tableType_ = ROW(std::move(names), inputType_->children());
+  std::vector<TypePtr> childTypes;
+  childTypes.reserve(inputType_->size());
+  for (vector_size_t i = 0; i < inputType_->size(); ++i) {
+    childTypes.push_back(inputType_->childAt(i));
+  }
+  tableType_ = ROW(std::move(names), std::move(childTypes));
 }
 
 void HashTableBuilder::setupTable(memory::MemoryPool* pool) {

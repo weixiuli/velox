@@ -1298,7 +1298,7 @@ TEST_P(HashTableTest, builderSerializeRoundTrip) {
     tbl->prepareForJoinProbe(lookup, input, rows, true);
     tbl->joinProbe(lookup);
 
-    std::vector<char*> hits;
+    std::vector<const char*> hits;
     hits.reserve(input->size());
     for (auto i = 0; i < input->size(); ++i) {
       ASSERT_NE(lookup.hits[i], nullptr);
@@ -1307,9 +1307,7 @@ TEST_P(HashTableTest, builderSerializeRoundTrip) {
 
     auto values = BaseVector::create(BIGINT(), hits.size(), pool());
     tbl->rows()->extractColumn(
-        folly::Range<char* const*>(hits.data(), hits.size()),
-        tbl->hashers().size(),
-        values);
+        hits.data(), hits.size(), tbl->hashers().size(), values);
     auto flat = values->as<FlatVector<int64_t>>();
     std::vector<int64_t> result(hits.size());
     for (auto i = 0; i < hits.size(); ++i) {
