@@ -437,6 +437,19 @@ class BaseHashTable {
       int32_t columnIndex,
       const VectorPtr& result) = 0;
 
+  /// Serializes the hash table into a binary string that can be transferred to
+  /// another process. The serialized output contains all the metadata and the
+  /// payload rows required to reconstruct an equivalent hash table via
+  /// `BaseHashTable::deserialize`.
+  virtual std::string serialize() const = 0;
+
+  /// Deserializes a hash table from the binary string produced by
+  /// `serialize()`. The caller is responsible for providing the memory pool to
+  /// use for the resulting hash table.
+  static std::shared_ptr<BaseHashTable> deserialize(
+      const std::string& serialized,
+      memory::MemoryPool* pool);
+
  protected:
   static FOLLY_ALWAYS_INLINE size_t tableSlotSize() {
     // Each slot is 8 bytes.
@@ -675,6 +688,8 @@ class HashTable : public BaseHashTable {
         columnHasNulls_[columnIndex],
         result);
   }
+
+  std::string serialize() const override;
 
   auto& testingOtherTables() const {
     return otherTables_;
