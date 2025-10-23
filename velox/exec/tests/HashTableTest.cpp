@@ -15,6 +15,7 @@
  */
 
 #include "velox/exec/HashTable.h"
+#include "velox/exec/HashTableBuilder.h"
 #include "folly/experimental/EventCount.h"
 #include "velox/common/base/SelectivityInfo.h"
 #include "velox/common/base/tests/GTestUtils.h"
@@ -1268,6 +1269,60 @@ TEST_P(HashTableTest, toStringMultipleKeys) {
   table->prepareJoinTable({}, BaseHashTable::kNoSpillInputStartPartitionBit);
 
   ASSERT_NO_THROW(table->toString());
+}
+
+TEST_P(HashTableTest, builderSerializeRoundTrip) {
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3, 4, 5}),
+      makeFlatVector<int64_t>({10, 20, 30, 40, 50}),
+  });
+
+  HashTableBuilder builder(
+      pool(),
+      asRowType(input->type()),
+      {0},
+      core::JoinType::kInner,
+      false, /*nullAware*/
+      false, /*hasFilter*/
+      1 /*minTableSizeForParallelJoinBuild*/);
+
+  builder.addInput(input);
+  auto table = builder.build();
+  auto serialized = table->serialize();
+  auto restored = BaseHashTable::deserialize(serialized, pool());
+
+  auto gatherValues = [&](const std::shared_ptr<BaseHashTable>& tbl)
+      -> std::vector<int64_t> {
+    HashLookup lookup(tbl->hashers(), pool());
+    SelectivityVector rows(input->size());
+    rows.setAll();
+    tbl->prepareForJoinProbe(lookup, input, rows, true);
+    tbl->joinProbe(lookup);
+
+    std::vector<const char*> hits;
+    hits.reserve(input->size());
+    for (auto i = 0; i < input->size(); ++i) {
+      EXPECT_NE(lookup.hits[i], nullptr);
+      hits.push_back(lookup.hits[i]);
+    }
+
+    auto values = BaseVector::create(BIGINT(), hits.size(), pool());
+    tbl->rows()->extractColumn(
+        hits.data(),
+        static_cast<int32_t>(hits.size()),
+        static_cast<int32_t>(tbl->hashers().size()),
+        values);
+    auto flat = values->as<FlatVector<int64_t>>();
+    std::vector<int64_t> result(hits.size());
+    for (auto i = 0; i < hits.size(); ++i) {
+      result[i] = flat->valueAt(i);
+    }
+    return result;
+  };
+
+  auto expected = gatherValues(table);
+  auto actual = gatherValues(restored);
+  EXPECT_EQ(expected, actual);
 }
 
 TEST(HashTableTest, tableInsertPartitionInfo) {
